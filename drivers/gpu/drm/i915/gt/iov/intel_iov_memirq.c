@@ -21,7 +21,7 @@
 #define MEMIRQ_DEBUG(...)
 #endif
 
-/**
+/*
  * Memory based irq page layout
  * We use a single page to contain the different objects used for memory
  * based irq (which are also called "page" in the specs, even if they
@@ -64,7 +64,7 @@ static int vf_create_memirq_data(struct intel_iov *iov)
 		goto out;
 	}
 
-	vaddr = i915_gem_object_pin_map_unlocked(obj, i915_coherent_map_type(i915, obj, true));
+	vaddr = i915_gem_object_pin_map_unlocked(obj, i915_coherent_map_type(iov_to_gt(iov), obj, true));
 	if (IS_ERR(vaddr)) {
 		err = PTR_ERR(vaddr);
 		goto out_obj;
@@ -151,7 +151,7 @@ int intel_iov_memirq_init(struct intel_iov *iov)
 }
 
 /**
- * intel_iov_irq_fini - Release data used by memory based interrupts.
+ * intel_iov_memirq_fini - Release data used by memory based interrupts.
  * @iov: the IOV struct
  *
  * Release data used by memory based interrupts.

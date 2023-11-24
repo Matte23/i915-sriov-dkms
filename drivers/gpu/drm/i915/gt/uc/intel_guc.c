@@ -16,6 +16,7 @@
 #include "intel_guc_submission.h"
 #include "i915_drv.h"
 #include "i915_irq.h"
+#include "i915_reg.h"
 
 #ifdef CONFIG_DRM_I915_DEBUG_GUC
 #define GUC_DEBUG(_guc, _fmt, ...) guc_dbg(_guc, _fmt, ##__VA_ARGS__)
@@ -286,18 +287,14 @@ static u32 guc_ctl_wa_flags(struct intel_guc *guc)
 	    GRAPHICS_VER_FULL(gt->i915) < IP_VER(12, 50))
 		flags |= GUC_WA_POLLCS;
 
-	/* Wa_16011759253:dg2_g10:a0 */
-	if (IS_DG2_GRAPHICS_STEP(gt->i915, G10, STEP_A0, STEP_B0))
-		flags |= GUC_WA_GAM_CREDITS;
-
 	/* Wa_14014475959 */
-	if (IS_MTL_GRAPHICS_STEP(gt->i915, M, STEP_A0, STEP_B0) ||
+	if (IS_GFX_GT_IP_STEP(gt, IP_VER(12, 70), STEP_A0, STEP_B0) ||
 	    IS_DG2(gt->i915))
 		flags |= GUC_WA_HOLD_CCS_SWITCHOUT;
 
 	/*
-	 * Wa_14012197797:dg2_g10:a0,dg2_g11:a0
-	 * Wa_22011391025:dg2_g10,dg2_g11,dg2_g12
+	 * Wa_14012197797
+	 * Wa_22011391025
 	 *
 	 * The same WA bit is used for both and 22011391025 is applicable to
 	 * all DG2.
@@ -306,27 +303,23 @@ static u32 guc_ctl_wa_flags(struct intel_guc *guc)
 		flags |= GUC_WA_DUAL_QUEUE;
 
 	/* Wa_22011802037: graphics version 11/12 */
-	if (IS_MTL_GRAPHICS_STEP(gt->i915, M, STEP_A0, STEP_B0) ||
-	    (GRAPHICS_VER(gt->i915) >= 11 &&
-	    GRAPHICS_VER_FULL(gt->i915) < IP_VER(12, 70)))
+	if (intel_engine_reset_needs_wa_22011802037(gt))
 		flags |= GUC_WA_PRE_PARSER;
 
-	/* Wa_16011777198:dg2 */
-	if (IS_DG2_GRAPHICS_STEP(gt->i915, G10, STEP_A0, STEP_C0) ||
-	    IS_DG2_GRAPHICS_STEP(gt->i915, G11, STEP_A0, STEP_B0))
-		flags |= GUC_WA_RCS_RESET_BEFORE_RC6;
-
 	/*
-	 * Wa_22012727170:dg2_g10[a0-c0), dg2_g11[a0..)
-	 * Wa_22012727685:dg2_g11[a0..)
+	 * Wa_22012727170
+	 * Wa_22012727685
 	 */
-	if (IS_DG2_GRAPHICS_STEP(gt->i915, G10, STEP_A0, STEP_C0) ||
-	    IS_DG2_GRAPHICS_STEP(gt->i915, G11, STEP_A0, STEP_FOREVER))
+	if (IS_DG2_G11(gt->i915))
 		flags |= GUC_WA_CONTEXT_ISOLATION;
 
 	/* Wa_16015675438 */
 	if (!RCS_MASK(gt))
 		flags |= GUC_WA_RCS_REGS_IN_CCS_REGS_LIST;
+
+	/* Wa_14019103365 */
+	if (IS_METEORLAKE(gt->i915) && IS_SRIOV_PF(gt->i915) && HAS_ENGINE(gt, GSC0))
+		flags |= GUC_WA_DISABLE_GSC_RESET_IN_VF;
 
 	return flags;
 }
@@ -816,10 +809,11 @@ struct i915_vma *intel_guc_allocate_vma(struct intel_guc *guc, u32 size)
 		return ERR_CAST(obj);
 
 	/*
-	 * Wa_22016122933: For MTL the shared memory needs to be mapped
-	 * as WC on CPU side and UC (PAT index 2) on GPU side
+	 * Wa_22016122933: For Media version 13.0, all Media GT shared
+	 * memory needs to be mapped as WC on CPU side and UC (PAT
+	 * index 2) on GPU side.
 	 */
-	if (IS_METEORLAKE(gt->i915))
+	if (intel_gt_needs_wa_22016122933(gt))
 		i915_gem_object_set_cache_coherency(obj, I915_CACHE_NONE);
 
 	vma = i915_vma_instance(obj, &gt->ggtt->vm, NULL);
@@ -863,7 +857,7 @@ int intel_guc_allocate_and_map_vma(struct intel_guc *guc, u32 size,
 		return PTR_ERR(vma);
 
 	vaddr = i915_gem_object_pin_map_unlocked(vma->obj,
-						 i915_coherent_map_type(guc_to_gt(guc)->i915,
+						 i915_coherent_map_type(guc_to_gt(guc),
 									vma->obj, true));
 	if (IS_ERR(vaddr)) {
 		i915_vma_unpin_and_release(&vma, 0);
@@ -925,134 +919,32 @@ int intel_guc_self_cfg64(struct intel_guc *guc, u16 key, u64 value)
 	return __guc_self_cfg(guc, key, 2, value);
 }
 
-static long must_wait_woken(struct wait_queue_entry *wq_entry, long timeout)
+int intel_guc_enable_gsc_engine(struct intel_guc *guc)
 {
-	/*
-	 * This is equivalent to wait_woken() with the exception that
-	 * we do not wake up early if the kthread task has been completed.
-	 * As we are called from page reclaim in any task context,
-	 * we may be invoked from stopped kthreads, but we *must*
-	 * complete the wait from the HW .
-	 *
-	 * A second problem is that since we are called under reclaim
-	 * and wait_woken() inspected the thread state, it makes an invalid
-	 * assumption that all PF_KTHREAD tasks have set_kthread_struct()
-	 * called upon them, and will trigger a GPF in is_kthread_should_stop().
-	 */
-	do {
-		set_current_state(TASK_UNINTERRUPTIBLE);
-		if (wq_entry->flags & WQ_FLAG_WOKEN)
-			break;
+	struct intel_gt *gt = guc_to_gt(guc);
 
-		timeout = schedule_timeout(timeout);
-	} while (timeout);
-	__set_current_state(TASK_RUNNING);
+	if (!HAS_ENGINE(gt, GSC0))
+		return 0;
 
-	/* See wait_woken() and woken_wake_function() */
-	smp_store_mb(wq_entry->flags, wq_entry->flags & ~WQ_FLAG_WOKEN);
-
-	return timeout;
+	return intel_guc_set_engine_sched(guc, GUC_GSC_OTHER_CLASS, SET_ENGINE_SCHED_FLAGS_ENABLE);
 }
 
-static int guc_send_invalidate_tlb(struct intel_guc *guc, u32 *action, u32 size)
+int intel_guc_disable_gsc_engine(struct intel_guc *guc)
 {
-	struct intel_guc_tlb_wait _wq, *wq = &_wq;
-	DEFINE_WAIT_FUNC(wait, woken_wake_function);
-	int err = 0;
-	u32 seqno;
+	struct intel_gt *gt = guc_to_gt(guc);
+	int err;
 
-	init_waitqueue_head(&_wq.wq);
+	if (!HAS_ENGINE(gt, GSC0))
+		return 0;
 
-	if (xa_alloc_cyclic_irq(&guc->tlb_lookup, &seqno, wq,
-				xa_limit_32b, &guc->next_seqno,
-				GFP_ATOMIC | __GFP_NOWARN) < 0) {
-		/* Under severe memory pressure? Serialise TLB allocations */
-		xa_lock_irq(&guc->tlb_lookup);
-		wq = xa_load(&guc->tlb_lookup, guc->serial_slot);
-		wait_event_lock_irq(wq->wq,
-				    !READ_ONCE(wq->status),
-				    guc->tlb_lookup.xa_lock);
-		/*
-		 * Update wq->status under lock to ensure only one waiter can
-		 * issue the tlb invalidation command using the serial slot at a
-		 * time. The condition is set to false before releasing the lock
-		 * so that other caller continue to wait until woken up again.
-		 */
-		wq->status = 1;
-		xa_unlock_irq(&guc->tlb_lookup);
+	if (wait_for(intel_engine_is_idle(gt->engine[GSC0]), I915_GEM_IDLE_TIMEOUT))
+		return -EBUSY;
 
-		seqno = guc->serial_slot;
-	}
+	err = intel_guc_set_engine_sched(guc, GUC_GSC_OTHER_CLASS, 0);
+	if (err < 0)
+		return err;
 
-	action[1] = seqno;
-
-	add_wait_queue(&wq->wq, &wait);
-
-	err = intel_guc_send_busy_loop(guc, action, size, G2H_LEN_DW_INVALIDATE_TLB, true);
-	if (err) {
-		goto out;
-	}
-/*
- * GuC has a timeout of 1ms for a tlb invalidation response from GAM. On a
- * timeout GuC drops the request and has no mechanism to notify the host about
- * the timeout. So keep a larger timeout that accounts for this individual
- * timeout and max number of outstanding invalidation requests that can be
- * queued in CT buffer.
- */
-#define OUTSTANDING_GUC_TIMEOUT_PERIOD  (HZ)
-	if (!must_wait_woken(&wait, OUTSTANDING_GUC_TIMEOUT_PERIOD)) {
-		/*
-		 * XXX: Failure of tlb invalidation is critical and would
-		 * warrant a gt reset.
-		 */
-		drm_err(&guc_to_gt(guc)->i915->drm,
-			 "tlb invalidation response timed out for seqno %u\n", seqno);
-		err = -ETIME;
-	}
-out:
-	remove_wait_queue(&wq->wq, &wait);
-	if (seqno != guc->serial_slot)
-		xa_erase_irq(&guc->tlb_lookup, seqno);
-
-	return err;
-}
-
- /* Full TLB invalidation */
-int intel_guc_invalidate_tlb_full(struct intel_guc *guc,
-				  enum intel_guc_tlb_inval_mode mode)
-{
-	u32 action[] = {
-		INTEL_GUC_ACTION_TLB_INVALIDATION,
-		0,
-		INTEL_GUC_TLB_INVAL_FULL << INTEL_GUC_TLB_INVAL_TYPE_SHIFT |
-			mode << INTEL_GUC_TLB_INVAL_MODE_SHIFT |
-			INTEL_GUC_TLB_INVAL_FLUSH_CACHE,
-	};
-
-	if (!INTEL_GUC_SUPPORTS_TLB_INVALIDATION(guc))
-		return -EINVAL;
-
-	return guc_send_invalidate_tlb(guc, action, ARRAY_SIZE(action));
-}
-
-/*
- * Guc TLB Invalidation: Invalidate the TLB's of GuC itself.
- */
-int intel_guc_invalidate_tlb_guc(struct intel_guc *guc,
-				 enum intel_guc_tlb_inval_mode mode)
-{
-	u32 action[] = {
-		INTEL_GUC_ACTION_TLB_INVALIDATION,
-		0,
-		INTEL_GUC_TLB_INVAL_GUC << INTEL_GUC_TLB_INVAL_TYPE_SHIFT |
-			mode << INTEL_GUC_TLB_INVAL_MODE_SHIFT |
-			INTEL_GUC_TLB_INVAL_FLUSH_CACHE,
-	};
-
-	if (!INTEL_GUC_SUPPORTS_TLB_INVALIDATION(guc))
-		return -EINVAL;
-
-	return guc_send_invalidate_tlb(guc, action, ARRAY_SIZE(action));
+	return __intel_gt_reset(gt, gt->engine[GSC0]->mask);
 }
 
 /**

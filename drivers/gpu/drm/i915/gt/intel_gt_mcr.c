@@ -4,7 +4,7 @@
  */
 
 #include "i915_drv.h"
-
+#include "intel_gt.h"
 #include "intel_gt_mcr.h"
 #include "intel_gt_print.h"
 #include "intel_gt_regs.h"
@@ -35,7 +35,7 @@
  * ignored.
  */
 
-#define HAS_MSLICE_STEERING(dev_priv)	(INTEL_INFO(dev_priv)->has_mslice_steering)
+#define HAS_MSLICE_STEERING(i915)	(INTEL_INFO(i915)->has_mslice_steering)
 
 static const char * const intel_steering_types[] = {
 	"L3BANK",
@@ -162,12 +162,12 @@ void intel_gt_mcr_init(struct intel_gt *gt)
 			gt_warn(gt, "mslice mask all zero!\n");
 	}
 
-	if (MEDIA_VER(i915) >= 13 && gt->type == GT_MEDIA) {
+	if (gt->type == GT_MEDIA && MEDIA_VER(i915) >= 13) {
 		gt->steering_table[OADDRM] = xelpmp_oaddrm_steering_table;
 	} else if (GRAPHICS_VER_FULL(i915) >= IP_VER(12, 70)) {
 		/* Wa_14016747170 */
-		if (IS_MTL_GRAPHICS_STEP(i915, M, STEP_A0, STEP_B0) ||
-		    IS_MTL_GRAPHICS_STEP(i915, P, STEP_A0, STEP_B0))
+		if (IS_GFX_GT_IP_STEP(gt, IP_VER(12, 70), STEP_A0, STEP_B0) ||
+		    IS_GFX_GT_IP_STEP(gt, IP_VER(12, 71), STEP_A0, STEP_B0))
 			fuse = REG_FIELD_GET(MTL_GT_L3_EXC_MASK,
 					     intel_uncore_read(gt->uncore,
 							       MTL_GT_ACTIVITY_FACTOR));
@@ -364,6 +364,7 @@ static u32 rw_with_mcr_steering(struct intel_gt *gt,
  *          function call.
  */
 void intel_gt_mcr_lock(struct intel_gt *gt, unsigned long *flags)
+	__acquires(&gt->mcr_lock)
 {
 	unsigned long __flags;
 	int err = 0;
@@ -410,6 +411,7 @@ void intel_gt_mcr_lock(struct intel_gt *gt, unsigned long *flags)
  * Context: Releases gt->mcr_lock
  */
 void intel_gt_mcr_unlock(struct intel_gt *gt, unsigned long flags)
+	__releases(&gt->mcr_lock)
 {
 	spin_unlock_irqrestore(&gt->mcr_lock, flags);
 
@@ -559,11 +561,14 @@ static bool reg_needs_read_steering(struct intel_gt *gt,
 				    i915_mcr_reg_t reg,
 				    enum intel_steering_type type)
 {
-	const u32 offset = i915_mmio_reg_offset(reg);
+	u32 offset = i915_mmio_reg_offset(reg);
 	const struct intel_mmio_range *entry;
 
 	if (likely(!gt->steering_table[type]))
 		return false;
+
+	if (IS_GSI_REG(offset))
+		offset += gt->uncore->gsi_offset;
 
 	for (entry = gt->steering_table[type]; entry->end; entry++) {
 		if (offset >= entry->start && offset <= entry->end)
